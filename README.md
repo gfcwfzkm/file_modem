@@ -2,6 +2,7 @@
 Basic file transmission functions for embedded systems
 
 Currently only x-modem is implemented. The usage is rather simple and straight forward. Currently it is set up to be used with FATFS (should be easy to modify to any other FS library).
+An example implementation of the required functions, that have to be passed in the initialization, can be found at the bottom of the header file.
 
 Example:
 ```C
