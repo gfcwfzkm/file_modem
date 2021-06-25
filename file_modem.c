@@ -10,13 +10,13 @@
  */ 
 
 #include "file_modem.h"
+#include <util/delay.h>
 
 /* Supported Packet Sizes. Theoretically, more sizes could be added
  * (Possible Z-Modem Implementation in the future? */
 #define PCK_SIZ	128
 #define PCK_1K	1024
 
-#define XMODEM_NON_STANDARD
 
 #define SOH		0x01	// Start of Packet, 256 Bytes
 #define STX		0x02	// Start of Packet, 1024 Bytes
@@ -33,12 +33,14 @@
 #define MAX_ERR	10		// Amount of Retries before the receiver gives up
 #define SRT_TRY	5		// Amount of retries to initiate a CRC transmission, followed by retries of checksum transmission,
 						// before the receiver gives up
-						
+
 #define TIMEOUT	3000	// Timeout time in seconds
 						// I know, the original docs state 10 seconds, but I feel
 						// like that it's a bit long, at 10 retries.
 
-static uint8_t workbuf[PCK_1K];
+/* Work-Buffer that will hold the data packet */
+static uint8_t u8a_workbuf[PCK_1K];
+enum packageResult {PCK_128_RECV,PCK_1K_RECV,PCK_EOT,PCK_TIMEOUT,PCK_INVALID,PCK_CANCEL};
 
 /**
   * @brief Calculates the CRC Checksum of a data packet
@@ -133,83 +135,182 @@ void (*_flushRx)(void);
   *
   * @return		Result of the receiving process: 0 for a normal packet, 1 for a 1k packet, 2 for a EndOfFile,
   *             3 for a general timeout, 4 for a Check Error, 5 for Abort */
-	
-static uint8_t _receivePacket(uint8_t *data, uint8_t expPacketNum, uint8_t useCRC)
+static enum packageResult _receivePacket(uint8_t *p_data, uint8_t u8_expPacketNum, uint8_t b_useCRC)
 {
-	uint16_t packet_size, cnt_i, receivedCRC = 0;
-	uint8_t packet_number[2], ch = 0;
+	uint16_t u16_pck_siz, u16_cnt, u16_recvCRC = 0;
+	uint8_t u8_pckNum[2], u8_ch = 0;
 	
 	// receive and process first byte
-	if (_recByte(&ch, TIMEOUT))		return 3;	
-	switch(ch)
+	if (_recByte(&u8_ch, TIMEOUT))		return PCK_TIMEOUT;	
+	switch(u8_ch)
 	{
 		case SOH:	// Normal Packet Size (128 Bytes)
-			packet_size = PCK_SIZ;
+			u16_pck_siz = PCK_SIZ;
 			break;
 		case STX:	// 1k-XMODEM (1024 Bytes)
-			packet_size = PCK_1K;
+			u16_pck_siz = PCK_1K;
 			break;
 		case EOT:	// End of File - No more data to be received
-			return 2;
+			return PCK_EOT;
 		case CAN:	// Abort (not fully standard?)
 #ifdef XMODEM_NON_STANDARD
 		case ABORT1:
 		case ABORT2:
 			/* Cancel-Signal from user received (either small 'a' or large 'A'
 			 * This is NOT STANDARD from the XMODEM / 1k-XMODEM / YMODEM protocol! */
-			return 5;
+			return PCK_CANCEL;
 #endif
 		default:
 			/* Gibberish received? Retry */
-			return 4;
+			return PCK_INVALID;
 	}
 	
 	/* Read the packet Number & inversed packet number */
-	if (_recByte(&ch, TIMEOUT))	return 3;
-	packet_number[0] = ch;
-	if (_recByte(&ch, TIMEOUT))	return 3;
-	packet_number[1] = ch;
+	if (_recByte(&u8_ch, TIMEOUT))	return PCK_TIMEOUT;
+	u8_pckNum[0] = u8_ch;
+	if (_recByte(&u8_ch, TIMEOUT))	return PCK_TIMEOUT;
+	u8_pckNum[1] = u8_ch;
 	
 	/* Start receiving the data finally */
-	for (cnt_i = 0; cnt_i < packet_size; cnt_i++)
+	for (u16_cnt = 0; u16_cnt < u16_pck_siz; u16_cnt++)
 	{
-		if (_recByte(&ch, TIMEOUT))	return 3;
-		data[cnt_i] = ch;
+		if (_recByte(&u8_ch, TIMEOUT))	return PCK_TIMEOUT;
+		p_data[u16_cnt] = u8_ch;
 	}
 	
 	/* Receive the checksum / CRC at the end */
-	if (useCRC)
+	if (b_useCRC)
 	{
-		if (_recByte(&ch, TIMEOUT))	return 3;
-		receivedCRC = (uint16_t)ch << 8;
-		if (_recByte(&ch, TIMEOUT))	return 3;
-		receivedCRC |= ch;
+		if (_recByte(&u8_ch, TIMEOUT))	return PCK_TIMEOUT;
+		u16_recvCRC = (uint16_t)u8_ch << 8;
+		if (_recByte(&u8_ch, TIMEOUT))	return PCK_TIMEOUT;
+		u16_recvCRC |= u8_ch;
 	}
 	else
 	{
-		if (_recByte(&ch, TIMEOUT))	return 3;
-		receivedCRC = ch;
+		if (_recByte(&u8_ch, TIMEOUT))	return PCK_TIMEOUT;
+		u16_recvCRC = u8_ch;
 	}
 	
 	/* Checking of the received data packet integrity starts here (if it didn't timeout before) */
 	/* Start by checking the packet ID first */
-	packet_number[1] = ~packet_number[1];
-	if (packet_number[0] != packet_number[1])	return 4;
-	if (packet_number[0] != expPacketNum)		return 4;
+	u8_pckNum[1] = ~u8_pckNum[1];
+	if (u8_pckNum[0] != u8_pckNum[1])	return PCK_INVALID;
+	if (u8_pckNum[0] != u8_expPacketNum)		return PCK_INVALID;
 	
 	/* Check Checksum / CRC of the packet */
-	if (_checkPacket(useCRC, receivedCRC, data, packet_size))	return 4;
+	if (_checkPacket(b_useCRC, u16_recvCRC, p_data, u16_pck_siz))	return 4;
 	
 	/* Check if normal or 1k package has been processed, return that info */
-	if (packet_size == PCK_SIZ)	return 0;
-	return 1;
+	if (u16_pck_siz == PCK_SIZ)	return PCK_128_RECV;
+	return PCK_1K_RECV;
 }
+
 /*
+To-Do: Implementing a transmitting function to have a proper transceiver library
 static uint8_t _transmitPacket(uint8_t *data, uint8_t packetID, uint8_t useCRC)
 {
 	
 }
 */
+
+// Todo: seperate xmodem and ymodem calls being handled by the same function:
+uint8_t _modem_receive(FIL *ffd, uint32_t *maxsize)
+{
+	uint8_t u8_pckRes;			// Result of the function _receivePacket to process
+	uint8_t u8_pckCnt = 1;		// Packet Counter. Xmodem starts with Packet 1. Can roll over
+	uint8_t u8_failCnt = 0;		// Counter of Timeouts or CRC/Checksum Errors. Resets
+								// after every successfully received packet.
+	uint8_t b_useCRC = 0;		// States if 16-bit CRC or basic 8-Bit Checksum has to be used
+	uint8_t u8_execLoop = 0;	// Loop and Function-Result variable. This function loops as
+								// long as excecuteLoop is Zero
+	uint16_t u8_bytesWritten;	// For (fatfs) f_write, to check if all Bytes have been written
+	uint16_t u8_bytesReceived;	// Holds if a 128 Bytes or 1k Bytes Packet has been received
+	uint32_t u8_totalBytes = 0;	// Amount of total Bytes received & written. Will be
+								// copied into *maxsize at function end.
+	
+	/* --- Main Receive Loop --- */
+	do{
+		/* Receive the Packet */
+		u8_pckRes = _receivePacket(u8a_workbuf, u8_pckCnt, b_useCRC);
+		
+		/* Process the result of the packet-receiving */
+		switch(u8_pckRes)
+		{
+			case 0:	/* 128 Bytes packet received */		
+			case 1:	/*  1k Bytes packet received */
+				/* Increment Packet Counter, reset the Error/Timeout Counter (failedAttempts)
+				 * and state that the initialTransmission is over */
+				u8_pckCnt++;
+				u8_failCnt = 0;
+				
+				/* Has a 128 Bytes or 1k Bytes packet been received?
+				 * Writing the packet size into bytesReceived */
+				u8_bytesReceived = (u8_pckRes ? PCK_SIZ : PCK_1K);
+				
+				/* Write the received Bytes from the buffer into the fileystem */
+				f_write(ffd, u8a_workbuf, u8_bytesReceived, &u8_bytesWritten);
+				
+				/* Disk full? Lets hope not! */
+				if (u8_bytesWritten < u8_bytesReceived)
+				{
+					// Error, Disk full!
+					return 5;
+				}
+				
+				/* File size larger than originally allowed/states? */
+				u8_totalBytes += u8_bytesReceived;
+				if(u8_totalBytes >= *maxsize)
+				{
+					// Error, max size reached!
+					return 6;
+				}
+				
+				/* Syncing the FS to reduce the data loss at a sudden power-down */
+				f_sync(ffd);
+				
+				/* Informing the Sender, that the packet has been recieved, processed
+				 * and that we're ready for the next packet. */
+				_sendByte(ACK);
+				break;
+			case 2:	/* End of File received */
+				
+				_sendByte(ACK);
+				u8_failCnt = 0;
+				u8_execLoop = 1;
+				break;
+			case 3:	/* Timeout */
+			case 4:	/* Checksum / Packet-ID / CRC Error */
+				/* Flush the Rx Buffer, assumed we have received only gibberish */
+				_flushRx();
+				
+				/* Failed transmission, retry MAX_ERR amount of times
+				 * before aborting the transmission */
+				u8_failCnt++;
+				if (u8_failCnt >= MAX_ERR)
+				{
+					u8_execLoop = 3;
+				}
+				/* Informing the Sender, that the last packet has not been received correctly
+				 * and request to send it again. */
+				_sendByte(NAK);
+				break;
+			case 5:	/* Aborted by Sender or User */
+				_flushRx();
+				u8_execLoop = 4;
+				break;
+		}
+	/* Loop as long as executeLoop is Zero.
+	 * If not Zero, exit loop, subscract 1 from it
+	 * and return it as function result. */
+	}while(u8_execLoop == 0);
+	
+	/* Return the amount of bytes received */
+	*maxsize = u8_totalBytes;
+	
+	/* Return the Result */
+	return --u8_execLoop;
+}
 
 /**
   * @brief Initialize the file modem by passing the nessesairy communication functions
@@ -229,21 +330,9 @@ void file_modem_init(uint8_t (*recByte)(uint8_t*,uint16_t), void (*sendByte)(uin
 	_flushRx = flushRx;
 }
 
-/**
-  * @brief Initialize and run a X-Modem receiver
-  * Supports either 128 (default) xmodem or 1k xmodem, either classic checksum or 16-bit CRC
-  *
-  * @param ffd		fatfs FIL to safe the receiving bytes to
-  * @param maxsize	Pointer to the maximum size you're willing to download and safe, before aborting
-  *                 The amount of received bytes will be stored back in this pointer.
-  *
-  * @return			0 for a successful execution, 1 for a failed start of the transmission,
-  *                 2 for a failed package request, 3 for an abort by user/transmitter,
-  *                 4 for fatfs disk potentially full, 5 for received data exceeds maxsize
-  */
-uint8_t xmodem_receive(FIL *ffd, uint32_t *maxsize)
+enum file_modem xmodem_receive(FIL *p_ffd, uint32_t *p_maxsize)
 {
-	uint8_t packetResult;		// Result of the function _receivePacket to process
+	enum packageResult packetResult;// Result of the function _receivePacket to process
 	uint8_t packetCounter = 1;	// Packet Counter. Xmodem starts with Packet 1. Can roll over
 	uint8_t failedAttempts = 0;	// Counter of Timeouts or CRC/Checksum Errors. Resets
 								// after every successfully received packet.
@@ -256,6 +345,8 @@ uint8_t xmodem_receive(FIL *ffd, uint32_t *maxsize)
 								// copied into *maxsize at function end.
 	uint8_t initialTransmission = 1;// States that the transmission just started 
 								// For CRC/Checkum negotiation
+	
+	volatile uint8_t loopCnt = 0;
 	
 	/* Dump Rx Buffer before we start, just to be safe */
 	_flushRx();
@@ -277,13 +368,13 @@ uint8_t xmodem_receive(FIL *ffd, uint32_t *maxsize)
 		}
 		
 		/* Receive the Packet */
-		packetResult = _receivePacket(workbuf, packetCounter, useCRC);
+		packetResult = _receivePacket(u8a_workbuf, packetCounter, useCRC);
 		
 		/* Process the result of the packet-receiving */
 		switch(packetResult)
 		{
-			case 0:	/* 128 Bytes packet received */		
-			case 1:	/*  1k Bytes packet received */
+			case PCK_128_RECV:	/* 128 Bytes packet received */		
+			case PCK_1K_RECV:	/*  1k Bytes packet received */
 				/* Increment Packet Counter, reset the Error/Timeout Counter (failedAttempts)
 				 * and state that the initialTransmission is over */
 				packetCounter++;
@@ -292,10 +383,10 @@ uint8_t xmodem_receive(FIL *ffd, uint32_t *maxsize)
 				
 				/* Has a 128 Bytes or 1k Bytes packet been received?
 				 * Writing the packet size into bytesReceived */
-				bytesReceived = (packetResult ? PCK_SIZ : PCK_1K);
+				bytesReceived = ((packetResult==PCK_1K_RECV) ? PCK_1K : PCK_SIZ);
 				
 				/* Write the received Bytes from the buffer into the fileystem */
-				f_write(ffd, workbuf, bytesReceived, &fs_bytesWritten);
+				f_write(p_ffd, u8a_workbuf, bytesReceived, &fs_bytesWritten);
 				
 				/* Disk full? Lets hope not! */
 				if (fs_bytesWritten < bytesReceived)
@@ -306,27 +397,32 @@ uint8_t xmodem_receive(FIL *ffd, uint32_t *maxsize)
 				
 				/* File size larger than originally allowed/states? */
 				totalBytesWritten += bytesReceived;
-				if(totalBytesWritten >= *maxsize)
+				if(totalBytesWritten >= *p_maxsize)
 				{
 					// Error, max size reached!
 					return 6;
 				}
 				
 				/* Syncing the FS to reduce the data loss at a sudden power-down */
-				f_sync(ffd);
-				
+				//f_sync(p_ffd);
+				/* No delay -> ExtraPUTTY crashes without a error message after a few hundred
+				 * packages. Seems to work usable with a delay of 5ms tho, and definitely faster
+				 * than with f_sync each time */
+				_delay_ms(10);
 				/* Informing the Sender, that the packet has been recieved, processed
 				 * and that we're ready for the next packet. */
 				_sendByte(ACK);
-				break;
-			case 2:	/* End of File received */
 				
+				loopCnt++;
+				break;
+			case PCK_EOT:	/* End of File received */
+				f_sync(p_ffd);
 				_sendByte(ACK);
 				failedAttempts = 0;
 				excecuteLoop = 1;
 				break;
-			case 3:	/* Timeout */
-			case 4:	/* Checksum / Packet-ID / CRC Error */
+			case PCK_TIMEOUT:	/* Timeout */
+			case PCK_INVALID:	/* Checksum / Packet-ID / CRC Error */
 				/* Flush the Rx Buffer, assumed we have received only gibberish */
 				_flushRx();
 				
@@ -358,7 +454,7 @@ uint8_t xmodem_receive(FIL *ffd, uint32_t *maxsize)
 					_sendByte(NAK);
 				}
 				break;
-			case 5:	/* Aborted by Sender or User */
+			case PCK_CANCEL:	/* Aborted by Sender or User */
 				_flushRx();
 				excecuteLoop = 4;
 				break;
@@ -369,8 +465,9 @@ uint8_t xmodem_receive(FIL *ffd, uint32_t *maxsize)
 	}while(excecuteLoop == 0);
 	
 	/* Return the amount of bytes received */
-	*maxsize = totalBytesWritten;
+	*p_maxsize = loopCnt;
+	*p_maxsize = totalBytesWritten;
 	
 	/* Return the Result */
-	return --excecuteLoop;
+	return (enum file_modem)(--excecuteLoop);
 }
